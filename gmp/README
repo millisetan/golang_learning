@@ -1,5 +1,5 @@
                                                 goroutine      thread0                                                        resource
-init                                                g0            m0           g1                      m1                        g0   
+init                                                g0            m0           g1                      m1                        p0   
     g0.sched.pc=x01;                               x01----------|x01|         y01                    | S |                       m0   
     g1.sched.pc=y01;                               x01          |x01|        /y02                    | S |                       m0   
                                                    x02          |x02|       / y03                    | S |                       m0   
