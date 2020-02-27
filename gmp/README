@@ -1,7 +1,7 @@
                                                 goroutine      thread0                                                        resource
 init                                                g0            m0           g1                      m1                        g0   
-	g0.sched.pc=x01;                               x01----------|x01|         y01                    | S |                       m0   
-	g1.sched.pc=y01;                               x01          |x01|        /y02                    | S |                       m0   
+    g0.sched.pc=x01;                               x01----------|x01|         y01                    | S |                       m0   
+    g1.sched.pc=y01;                               x01          |x01|        /y02                    | S |                       m0   
                                                    x02          |x02|       / y03                    | S |                       m0   
                                                    x03          |x03|      /  y04                    | S |                       m0   
                                                    x04          |x04|     /   rcv                    | S |                       m0   
@@ -10,20 +10,20 @@ init                                                g0            m0           g
                                                    x07          |x07|  /      y08                    | S |                       m0   
                                                    snd----------|snd| /       snd                    | S |                       m0   
 A:  g0 block on send, m0 schedule g1 to run        x09          |SCH|/       /y10                    | S |                       m0   
-	g0.sched.pc=pc(x09);                           x10\         |y01|       / y11\                   | S |                       m0   
-	g0.sched.sp=cur_sp;                            rcv \        |y02|      /  y12 \                  | S |                       m0   
-	pc=g1.sched.pc(y01);                           x12  \       |y03|     /   y13  \                 | S |                       m0   
-	sp=g1.sched.sp                                 x13   \      |y04|    /    y14   \                | S |                       m0   
+    g0.sched.pc=pc(x09);                           x10\         |y01|       / y11\                   | S |                       m0   
+    g0.sched.sp=cur_sp;                            rcv \        |y02|      /  y12 \                  | S |                       m0   
+    pc=g1.sched.pc(y01);                           x12  \       |y03|     /   y13  \                 | S |                       m0   
+    sp=g1.sched.sp                                 x13   \      |y04|    /    y14   \                | S |                       m0   
                                                    x14    \     |rcv|   /     y15    \               | S |                       m0   
                                                    x15     \    |y06|  /      y16     \              | S |                       m0   
                                                    x16      \   |y07| /       y17      \             | S |                       m0   
                                                    x17       \  |y08|/        y18       \            | S |                       m0   
                                                    x18        \ |snd|         y19        \           | S |                       m0   
-B:	g1 block on send, m0 schedule g0 to run        x19         \|SCH|         y20         |          | S |                       m0   
-	g1.sched.pc=pc(y10);                           x20          |x09|         y22         |          | S |                       m0   
-	g1.sched.sp=cur_sp;                            x21          |x10|         y23         |          | S |                       m0   
-	pc=g0.sched.pc(x09);                           x22          |rcv|         y24         |          | S |                       m0   
-	sp=g0.sched.sp                                 sys          |x12|          . \        |          | S |                       m0   
+B:  g1 block on send, m0 schedule g0 to run        x19         \|SCH|         y20         |          | S |                       m0   
+    g1.sched.pc=pc(y10);                           x20          |x09|         y22         |          | S |                       m0   
+    g1.sched.sp=cur_sp;                            x21          |x10|         y23         |          | S |                       m0   
+    pc=g0.sched.pc(x09);                           x22          |rcv|         y24         |          | S |                       m0   
+    sp=g0.sched.sp                                 sys          |x12|          . \        |          | S |                       m0   
                                                    x24\         |x13|          .  \       |          | S |                       m0   
                                                    x25 \        |x14|              \      \          | S |                       m0   
                                                    x26  \       |x15|               \      \         | S |                       m0   
@@ -36,10 +36,10 @@ B:	g1 block on send, m0 schedule g0 to run        x19         \|SCH|         y20
                                                     .          \|x22|                     |       \  | S |                       m0   
                                                     .           |sys|                     |        \ | S |                       m0   
 C:  g0 and m0 both block on syscall                             |REL|                     |         \|ACQ|                       m1   
-	m0 release p0(resource), wakeup m1 and sleep                | S |                     |          |y10|                       m1   
-	m1 acqure p0, schedul g1 to run                             | S |                     |          |y11|                       m1   
-	                                                            | S |                     |          |y12|                       m1   
-	                                                            | S |                     \          |y13|                       m1   
+    m0 release p0(resource), wakeup m1 and sleep                | S |                     |          |y10|                       m1   
+    m1 acqure p0, schedul g1 to run                             | S |                     |          |y11|                       m1   
+                                                                | S |                     |          |y12|                       m1   
+                                                                | S |                     \          |y13|                       m1   
                                                                 | S |                      \         |y14|                       m1   
                                                                 | S |                       \        |y15|                       m1   
                                                                 | S |                        \       |y16|                       m1   
