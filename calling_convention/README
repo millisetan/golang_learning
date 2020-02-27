@@ -1,0 +1,21 @@
+main.main -> main.calling
+       ---> rbp(who call main.main)
+       |   ------   0x28
+       |     e
+0x38   |   ------   0x20
+       |     d
+0x30   |   ------   0x18
+       |     c
+0x28   |   ------   0x10
+       |     b
+0x20   |   ------   0x08
+       |     a
+0x18   |   ------   <--- old rsp
+       |    0x44f513(ip after call main.calling)
+0x10   |   ------
+       -----rbp(main.main)
+0x08       ------   <--- rbp
+             k
+rsp -->    ------
+
+
