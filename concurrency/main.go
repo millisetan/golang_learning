@@ -12,7 +12,7 @@ import (
 )
 
 func setDefaultTimeout(ctx context.Context, t time.Duration) (context.Context, context.CancelFunc) {
-	var cancel context.CancelFunc = func() { log.Fatal("fuck") }
+	var cancel context.CancelFunc = func() {}
 	if _, ok := ctx.Deadline(); !ok {
 		ctx, cancel = context.WithTimeout(ctx, t)
 	}
@@ -82,7 +82,7 @@ func doHandle(ctx context.Context, r req, h handler) <-chan respErr {
 	return c
 }
 
-//set up channel and context communication with handler
+//set up channel and context communication with doHandleSub
 func prepare(ctx context.Context, reqs []req, handlers []handler) ([]<-chan respErr, context.CancelFunc) {
 	cancels := make([]context.CancelFunc, len(reqs))
 	cancel := func() {
@@ -106,19 +106,6 @@ type waitController interface {
 	breakLoop([]*respErr) bool
 }
 
-func waitAnyResult(respErrs []*respErr, err error) (respErr, int, error) {
-	var zero respErr
-	if err != nil {
-		return zero, -1, err
-	}
-	for i, resp := range respErrs {
-		if resp != nil && resp.err == nil {
-			return *resp, i, nil
-		}
-	}
-	return zero, -1, errors.New("all request failed")
-}
-
 type waitAnyController int
 
 const waitAnyControllerConst = waitAnyController(0)
@@ -136,15 +123,6 @@ func (waitAnyController) breakLoop(resps []*respErr) bool {
 		}
 	}
 	return true
-}
-
-//wait until any request succeeded or all failed
-func waitAny(ctx context.Context, reqs []req, handlers []handler) (respErr, int, error) {
-	return waitAnyResult(wait(ctx, reqs, handlers, waitAnyControllerConst, 0))
-}
-
-func waitAnyPrefer(ctx context.Context, reqs []req, handlers []handler, delay time.Duration) (respErr, int, error) {
-	return waitAnyResult(wait(ctx, reqs, handlers, waitAnyControllerConst, delay))
 }
 
 type waitPrioController int
@@ -171,18 +149,29 @@ func (waitPrioController) breakLoop(resps []*respErr) bool {
 	return allFailures
 }
 
-//wait until any requests succeeded where all high priority requests are failed.
-func waitAnyPrio(ctx context.Context, reqs []req, handlers []handler) (respErr, int, error) {
-	return waitAnyResult(wait(ctx, reqs, handlers, waitPrioControllerConst, 0))
+func waitAnyResult(respErrs []*respErr, err error) (resp, int, error) {
+	var zero resp
+	if err != nil {
+		return zero, -1, err
+	}
+	for i, resp := range respErrs {
+		if resp != nil && resp.err == nil {
+			return resp.val, i, nil
+		}
+	}
+	return zero, -1, errors.New("all request failed")
 }
 
 type waitAllController int
 
 const waitAllControllerConst = waitAllController(0)
 
+//any request failed
 func (waitAllController) earlyReturn(r respErr) bool {
 	return r.err != nil
 }
+
+//all succeeded
 func (waitAllController) breakLoop(resps []*respErr) bool {
 	for _, resp := range resps {
 		if resp == nil {
@@ -192,11 +181,11 @@ func (waitAllController) breakLoop(resps []*respErr) bool {
 	return true
 }
 
-//wait until all request succeeded or any request failed
-func waitAll(ctx context.Context, reqs []req, handlers []handler) ([]*respErr, error) {
-	return wait(ctx, reqs, handlers, waitAllControllerConst, 0)
-}
-
+/*
+	Top down goroutine call.
+	bottom up channel return.
+	Asynchronously top down context cancel which require callee’s explicitly listening.
+*/
 func wait(ctx context.Context, reqs []req, handlers []handler, c waitController, delay time.Duration) ([]*respErr, error) {
 	if len(reqs) == 0 {
 		return nil, nil
@@ -204,6 +193,10 @@ func wait(ctx context.Context, reqs []req, handlers []handler, c waitController,
 	if len(reqs) != len(handlers) {
 		return nil, fmt.Errorf("len(reqs) != len(handlers)")
 	}
+	//get Timeout with default timeout 4 seconds.
+	ctx, cancel := setDefaultTimeout(ctx, 4*time.Second)
+	defer cancel()
+
 	next := len(reqs)
 	var delayTimer *time.Timer
 	waitDelayTimeout := func() <-chan time.Time {
@@ -259,10 +252,9 @@ func wait(ctx context.Context, reqs []req, handlers []handler, c waitController,
 			return next != len(reqs)
 		}
 		fastTriggerNext := func() {
-			if delayTimer != nil && delayTimer.Stop() {
-				if next != len(reqs) {
-					delayTimer.Reset(0)
-				}
+			//if trigger exists, not expired and there remains untriggered handler, let it run immediately
+			if delayTimer != nil && delayTimer.Stop() && more() {
+				delayTimer.Reset(0)
 			}
 		}
 		for {
@@ -275,6 +267,7 @@ func wait(ctx context.Context, reqs []req, handlers []handler, c waitController,
 				return respErrs, ctx.Err()
 			case 1:
 				if more() {
+					//run next handler, SELECT on it, prepare next trigger if there remains
 					chans, cancel := prepare(ctx, reqs[next:next+1], handlers[next:next+1])
 					defer cancel()
 					cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(chans[0])})
@@ -287,8 +280,7 @@ func wait(ctx context.Context, reqs []req, handlers []handler, c waitController,
 				cases[chosen] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(nil)}
 				chosen -= 2
 				if !recvOK {
-					fmt.Println(chosen)
-					panic("never happened1")
+					panic("never happened")
 				}
 				RespErr, ok := recv.Interface().(respErr)
 				if !ok {
@@ -298,7 +290,10 @@ func wait(ctx context.Context, reqs []req, handlers []handler, c waitController,
 				if c.earlyReturn(RespErr) {
 					return respErrs, RespErr.err
 				}
-				fastTriggerNext()
+				//if last one failed, faster trigger next handler
+				if chosen+1 == next {
+					fastTriggerNext()
+				}
 			}
 		}
 	}
@@ -310,45 +305,61 @@ func wait(ctx context.Context, reqs []req, handlers []handler, c waitController,
 	return respErrs, errors.New("all failed")
 }
 
-/*
-	Top down goroutine call.
-	bottom up channel return.
-	Asynchronously top down context cancel which require callee’s explicitly listening.
-*/
+//wait until any request succeeded or all failed
+func waitAny(ctx context.Context, reqs []req, handlers []handler) (resp, int, error) {
+	return waitAnyResult(wait(ctx, reqs, handlers, waitAnyControllerConst, 0))
+}
 
-func concurrent(ctx context.Context, reqs []req, handlers []handler, g gather) (resp, error) {
-	//get Timeout with default timeout 4 seconds.
-	ctx, cancel := setDefaultTimeout(ctx, 5*time.Second)
+/*
+	wait until any request succeeded or all failed, but run each handler with delay
+	e.g. run first handler, wait some time(delay),
+	if handler complete first. if handler success, return, else run next handler.
+	if delay timeout first, run next handler, wait on both handler now.
+*/
+func waitAnyPrefer(ctx context.Context, reqs []req, handlers []handler, delay time.Duration) (resp, int, error) {
+	return waitAnyResult(wait(ctx, reqs, handlers, waitAnyControllerConst, delay))
+}
+
+//wait until any requests succeeded where all high priority requests are failed.
+func waitAnyPrio(ctx context.Context, reqs []req, handlers []handler) (resp, int, error) {
+	return waitAnyResult(wait(ctx, reqs, handlers, waitPrioControllerConst, 0))
+}
+
+//wait until all request succeeded or any request failed
+func waitAll(ctx context.Context, reqs []req, handlers []handler) ([]*respErr, error) {
+	return wait(ctx, reqs, handlers, waitAllControllerConst, 0)
+}
+
+func waitAllAndGather(ctx context.Context, reqs []req, handlers []handler, g gather) (resp, error) {
+	ctx, cancel := setDefaultTimeout(ctx, 4*time.Second)
 	defer cancel()
-	// if timeout < min processing time, return immediately
 	respErrs, err := waitAll(ctx, reqs, handlers)
 	if err != nil {
 		return 0, err
 	}
 
-	resps := make([]resp, 0, len(respErrs))
-	for _, respErr := range respErrs {
-		if respErr != nil && respErr.err == nil {
-			resps = append(resps, respErr.val)
-		}
+	resps := make([]resp, len(respErrs))
+	for i, respErr := range respErrs {
+		resps[i] = respErr.val
 	}
 
 	return g(ctx, resps)
 }
 
-//do things in multi-stage style, check cancel signal at each stage.
 func sum(ctx context.Context, r []int) (int, error) {
 	deadline, _ := ctx.Deadline()
 	timeout := deadline.Sub(time.Now())
-	processTime := timeout * time.Duration(rand.Intn(1.2*100)) / 100 * 10000
+	processTime := timeout * time.Duration(rand.Intn(1.2*100)) / 100
 	log.Printf("[sum] req: %+v, timeout: %s, process time: %s\n", r, timeout, processTime)
 	s := 0
+	//do things in multi-stage style, check cancel signal at each stage.
 	for i, v := range r {
 		t := time.NewTimer(processTime / time.Duration(len(r)))
 		defer t.Stop()
 		select {
 		case <-t.C:
-			if rand.Intn(10) == 100 {
+			//random process time and random error
+			if rand.Intn(10) == 0 {
 				return 0, fmt.Errorf("[sum] req: %+v process failed", r)
 			}
 			s += v
@@ -361,14 +372,9 @@ func sum(ctx context.Context, r []int) (int, error) {
 }
 
 /*
-	((1+2)+(3+4)+(5+6))
-	  ---   ---   ---
-	   3  +  7  +  11
-	 -----------------
-			 21
-	run (1+2), (3+4), (5+6) simultaneously, wait all their returns (3, 7, 11) and sum them up together(3+7+11)
+	run (1+2), (3+4), (5+6) simultaneously, wait all their returns (3, 7, 11), sum them up(3+7+11)
 */
-func concurrentSum() {
+func waitAllAndGatherTest() {
 	sumHandler := func(ctx context.Context, r req) (resp, error) {
 		ints := r.([]int)
 		return sum(ctx, ints)
@@ -380,7 +386,7 @@ func concurrentSum() {
 		}
 		return sum(ctx, ints)
 	}
-	result, err := concurrent(context.Background(),
+	result, err := waitAllAndGather(context.Background(),
 		[]req{req([]int{1, 2}), req([]int{3, 4}), req([]int{5, 6})},
 		[]handler{sumHandler, sumHandler, sumHandler},
 		sumGather,
@@ -390,12 +396,33 @@ func concurrentSum() {
 		return
 	}
 	i := result.(int)
-	log.Printf("concurrentSum result: %d", i)
+	log.Printf("result: %d", i)
+}
+
+/*
+	run (1+2), (3+4), (5+6) simultaneously, return first one succeeded(3 or 7 or 11)
+*/
+func waitAnyTest() {
+	sumHandler := func(ctx context.Context, r req) (resp, error) {
+		ints := r.([]int)
+		return sum(ctx, ints)
+	}
+	reqs := []req{req([]int{1, 2}), req([]int{3, 4}), req([]int{5, 6})}
+	resp, i, err := waitAny(context.Background(),
+		reqs,
+		[]handler{sumHandler, sumHandler, sumHandler},
+	)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	log.Printf("waitAny reqs: %+v, req:%+v success, resp: %+v\n", reqs, reqs[i], resp)
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano()) //default rand source is goroutine safe
 	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
-	concurrentSum()
-	time.Sleep(5 * time.Second)
+	waitAnyTest()
+	//wait all goroutine to finish.
+	time.Sleep(3 * time.Second)
 }
