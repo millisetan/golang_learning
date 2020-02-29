@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -105,6 +106,47 @@ type waitController interface {
 	breakLoop([]*respErr) bool
 }
 
+func waitAnyResult(respErrs []*respErr, err error) (respErr, int, error) {
+	var zero respErr
+	if err != nil {
+		return zero, -1, err
+	}
+	for i, resp := range respErrs {
+		if resp != nil && resp.err == nil {
+			return *resp, i, nil
+		}
+	}
+	return zero, -1, errors.New("all request failed")
+}
+
+type waitAnyController int
+
+const waitAnyControllerConst = waitAnyController(0)
+
+//any request succeeded
+func (waitAnyController) earlyReturn(r respErr) bool {
+	return r.err == nil
+}
+
+//all failed
+func (waitAnyController) breakLoop(resps []*respErr) bool {
+	for _, resp := range resps {
+		if resp == nil {
+			return false
+		}
+	}
+	return true
+}
+
+//wait until any request succeeded or all failed
+func waitAny(ctx context.Context, reqs []req, handlers []handler) (respErr, int, error) {
+	return waitAnyResult(wait(ctx, reqs, handlers, waitAnyControllerConst, 0))
+}
+
+func waitAnyPrefer(ctx context.Context, reqs []req, handlers []handler, delay time.Duration) (respErr, int, error) {
+	return waitAnyResult(wait(ctx, reqs, handlers, waitAnyControllerConst, delay))
+}
+
 type waitPrioController int
 
 const waitPrioControllerConst = waitPrioController(0)
@@ -130,32 +172,8 @@ func (waitPrioController) breakLoop(resps []*respErr) bool {
 }
 
 //wait until any requests succeeded where all high priority requests are failed.
-func waitPrio(ctx context.Context, reqs []req, handlers []handler) ([]*respErr, error) {
-	return wait(ctx, reqs, handlers, waitPrioControllerConst)
-}
-
-type waitAnyController int
-
-const waitAnyControllerConst = waitAnyController(0)
-
-//any request succeeded
-func (waitAnyController) earlyReturn(r respErr) bool {
-	return r.err == nil
-}
-
-//all failed
-func (waitAnyController) breakLoop(resps []*respErr) bool {
-	for _, resp := range resps {
-		if resp == nil {
-			return false
-		}
-	}
-	return true
-}
-
-//wait until any request succeeded or all failed
-func waitAny(ctx context.Context, reqs []req, handlers []handler) ([]*respErr, error) {
-	return wait(ctx, reqs, handlers, waitAnyControllerConst)
+func waitAnyPrio(ctx context.Context, reqs []req, handlers []handler) (respErr, int, error) {
+	return waitAnyResult(wait(ctx, reqs, handlers, waitPrioControllerConst, 0))
 }
 
 type waitAllController int
@@ -176,76 +194,120 @@ func (waitAllController) breakLoop(resps []*respErr) bool {
 
 //wait until all request succeeded or any request failed
 func waitAll(ctx context.Context, reqs []req, handlers []handler) ([]*respErr, error) {
-	return wait(ctx, reqs, handlers, waitAllControllerConst)
+	return wait(ctx, reqs, handlers, waitAllControllerConst, 0)
 }
 
-func wait(ctx context.Context, reqs []req, handlers []handler, c waitController) ([]*respErr, error) {
+func wait(ctx context.Context, reqs []req, handlers []handler, c waitController, delay time.Duration) ([]*respErr, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
 	if len(reqs) != len(handlers) {
 		return nil, fmt.Errorf("len(reqs) != len(handlers)")
 	}
-	chans, cancel := prepare(ctx, reqs, handlers)
+	next := len(reqs)
+	var delayTimer *time.Timer
+	waitDelayTimeout := func() <-chan time.Time {
+		if delayTimer == nil {
+			return nil
+		}
+		return delayTimer.C
+	}
+	if delay != 0 {
+		delayTimer = time.NewTimer(delay)
+		next = 1
+	}
+
+	chans, cancel := prepare(ctx, reqs[:next], handlers[:next])
 	defer cancel()
 
 	respErrs := make([]*respErr, len(reqs))
-	if len(chans) <= 1 {
-		//common case speed up
-		for {
-			if c.breakLoop(respErrs) {
-				break
-			}
-			//select: listen on both callees's channel returns and caller's context cancel.
-			select {
-			case RespErr, ok := <-getChan(chans, 0):
-				//unregister from select(https://golang.org/ref/spec#Select_statements)
-				chans[0] = nil
-				if !ok {
-					panic("never happened")
+	/*
+		if len(chans) <= 1 {
+			//common case speed up
+			for {
+				if c.breakLoop(respErrs) {
+					break
 				}
-				respErrs[0] = &RespErr
-				if c.earlyReturn(RespErr) {
-					fmt.Println("xx")
-					return respErrs, RespErr.err
+				//select: listen on both callees's channel returns and caller's context cancel.
+				select {
+				case RespErr, ok := <-getChan(chans, 0):
+					//unregister from select(https://golang.org/ref/spec#Select_statements)
+					chans[0] = nil
+					if !ok {
+						panic("never happened")
+					}
+					respErrs[0] = &RespErr
+					if c.earlyReturn(RespErr) {
+						fmt.Println("xx")
+						return respErrs, RespErr.err
+					}
+				case <-ctx.Done():
+					return respErrs, ctx.Err()
 				}
-			case <-ctx.Done():
-				return respErrs, ctx.Err()
 			}
-		}
-	} else {
+		} else
+	*/
+	{
 		//dynamic way, readability & performance penalty(https://golang.org/pkg/reflect/#Select)
-		var cases = make([]reflect.SelectCase, len(reqs)+1)
+		var cases = make([]reflect.SelectCase, next+2, len(reqs)+2)
+		cases[0] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())}
+		cases[1] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(waitDelayTimeout())}
 		for i, c := range chans {
-			cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c)}
+			cases[i+2] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c)}
 		}
-		cases[len(cases)-1] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())}
+		more := func() bool {
+			return next != len(reqs)
+		}
+		fastTriggerNext := func() {
+			if delayTimer != nil && delayTimer.Stop() {
+				if next != len(reqs) {
+					delayTimer.Reset(0)
+				}
+			}
+		}
 		for {
 			if c.breakLoop(respErrs) {
 				break
 			}
 			chosen, recv, recvOK := reflect.Select(cases)
-			if chosen == len(cases)-1 {
+			switch chosen {
+			case 0:
 				return respErrs, ctx.Err()
-			}
-			//runtime.reflect caseNil always continued, little performance lost
-			chans[chosen] = nil
-			cases[chosen] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(nil)}
-			if !recvOK {
-				fmt.Println(chosen)
-				panic("never happened")
-			}
-			RespErr, ok := recv.Interface().(respErr)
-			if !ok {
-				panic("never happened")
-			}
-			respErrs[chosen] = &RespErr
-			if c.earlyReturn(RespErr) {
-				return respErrs, RespErr.err
+			case 1:
+				if more() {
+					chans, cancel := prepare(ctx, reqs[next:next+1], handlers[next:next+1])
+					defer cancel()
+					cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(chans[0])})
+					next++
+					if more() {
+						delayTimer.Reset(delay)
+					}
+				}
+			default:
+				cases[chosen] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(nil)}
+				chosen -= 2
+				if !recvOK {
+					fmt.Println(chosen)
+					panic("never happened1")
+				}
+				RespErr, ok := recv.Interface().(respErr)
+				if !ok {
+					panic("never happened")
+				}
+				respErrs[chosen] = &RespErr
+				if c.earlyReturn(RespErr) {
+					return respErrs, RespErr.err
+				}
+				fastTriggerNext()
 			}
 		}
 	}
-	return respErrs, nil
+	for _, resp := range respErrs {
+		if resp != nil && resp.err == nil {
+			return respErrs, nil
+		}
+	}
+	return respErrs, errors.New("all failed")
 }
 
 /*
@@ -256,10 +318,9 @@ func wait(ctx context.Context, reqs []req, handlers []handler, c waitController)
 
 func concurrent(ctx context.Context, reqs []req, handlers []handler, g gather) (resp, error) {
 	//get Timeout with default timeout 4 seconds.
-	ctx, cancel := setDefaultTimeout(ctx, 4*time.Second)
+	ctx, cancel := setDefaultTimeout(ctx, 5*time.Second)
 	defer cancel()
 	// if timeout < min processing time, return immediately
-
 	respErrs, err := waitAll(ctx, reqs, handlers)
 	if err != nil {
 		return 0, err
@@ -279,7 +340,7 @@ func concurrent(ctx context.Context, reqs []req, handlers []handler, g gather) (
 func sum(ctx context.Context, r []int) (int, error) {
 	deadline, _ := ctx.Deadline()
 	timeout := deadline.Sub(time.Now())
-	processTime := timeout * time.Duration(rand.Intn(1.2*100)) / 100
+	processTime := timeout * time.Duration(rand.Intn(1.2*100)) / 100 * 10000
 	log.Printf("[sum] req: %+v, timeout: %s, process time: %s\n", r, timeout, processTime)
 	s := 0
 	for i, v := range r {
@@ -334,7 +395,7 @@ func concurrentSum() {
 
 func main() {
 	rand.Seed(time.Now().UnixNano()) //default rand source is goroutine safe
-	log.SetFlags(log.Lshortfile | log.LstdFlags)
+	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
 	concurrentSum()
 	time.Sleep(5 * time.Second)
 }
