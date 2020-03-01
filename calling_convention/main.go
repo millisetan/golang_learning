@@ -72,7 +72,20 @@ func nestGoroutine2() {
 	fmt.Println(&c)
 }
 
+func x(i int) {
+	go func() {
+		fmt.Println("kk", i)
+	}()
+}
+
 func main() {
+	cancel := func() { fmt.Println("xx") }
+	defer cancel()
+	cancel = func() { fmt.Println("yy") }
+	defer cancel()
+	x(10)
+	time.Sleep(10 * time.Second)
+	return
 	var a = 10
 	fmt.Println("main", &a)
 	nestGoroutine()
