@@ -7,7 +7,6 @@ import (
 	"log"
 	"math/rand"
 	"reflect"
-	"runtime"
 	"time"
 )
 
@@ -28,67 +27,46 @@ func getProcessTimeout(ctx context.Context) time.Duration {
 	return deadline.Sub(time.Now()) / 2
 }
 
+//Req type
 type Req interface{}
+
+//Resp type
 type Resp interface{}
 
+//RespErr response with error
 type RespErr struct {
 	Result Resp
 	Err    error
 }
 
-type RespErrIdx struct {
+type respErrIdx struct {
 	RespErr
 	idx int
 }
 
-func getHandlerName(h handler) string {
-	return runtime.FuncForPC(reflect.ValueOf(h).Pointer()).Name()
-}
+//Handler prototype for request handler.
+type Handler func(ctx context.Context, r Req) (Resp, error)
 
-type handler func(ctx context.Context, r Req) (Resp, error)
-type gather func(ctx context.Context, resps []Resp) (Resp, error)
+//Gather gather all responses, and process them.
+type Gather func(ctx context.Context, resps []Resp) (Resp, error)
 
-func getChan(chans []<-chan RespErr, i int) <-chan RespErr {
-	if i < len(chans) {
-		return chans[i]
-	}
-	return nil
-}
-
-//run handler simultaneously, wait for Response and cancel signal
-func doHandleSub(ctx context.Context, c chan<- RespErr, r Req, h handler) {
-	//close c in only sender, indicates no more data can be read, needless here.
-	defer close(c)
-	waitResponse := func() <-chan RespErr {
-		c := make(chan RespErr)
-		go func() {
-			defer close(c)
-			var resp RespErr
-			defer func() { c <- resp }()
-			resp.Result, resp.Err = h(ctx, r)
-		}()
-		return c
-	}
-	select {
-	case resp, _ := <-waitResponse():
-		log.Printf("[process] Req: %+v, return: %+v, error: %+v\n", r, resp.Result, resp.Err)
-		c <- resp
-	case <-ctx.Done():
-		log.Printf("[context] Req: %+v, error: %+v\n", r, ctx.Err())
-		c <- RespErr{0, ctx.Err()}
-	}
-}
-
-//prepare channel Response
-func doHandle(ctx context.Context, r Req, h handler) <-chan RespErr {
+//prepare channel and start a goroutine do Handler.
+func doHandle(ctx context.Context, r Req, h Handler) <-chan RespErr {
 	c := make(chan RespErr, 1)
 	//take care when pass by reference!!
-	go doHandleSub(ctx, c, r, h)
+	go func() {
+		//close c in only sender, indicates no more data can be read, needless here.
+		defer close(c)
+		var resp RespErr
+		resp.Result, resp.Err = h(ctx, r)
+		log.Printf("[process] Req: %+v, return: %+v, error: %+v\n", r, resp.Result, resp.Err)
+		c <- resp
+	}()
 	return c
 }
 
-//set up channel and context communication with doHandleSub
-func prepare(ctx context.Context, reqs []Req, handlers []handler) ([]<-chan RespErr, context.CancelFunc) {
+//for each request, set up a channel, start a goroutine, wait for response, and send response to the channel.
+func prepare(ctx context.Context, reqs []Req, handlers []Handler) ([]<-chan RespErr, context.CancelFunc) {
 	cancels := make([]context.CancelFunc, len(reqs))
 	cancel := func() {
 		for _, cancel := range cancels {
@@ -105,7 +83,7 @@ func prepare(ctx context.Context, reqs []Req, handlers []handler) ([]<-chan Resp
 }
 
 type waitController interface {
-	//early return when recv Response
+	//early return when recv response
 	earlyReturn(RespErr) bool
 	//check if loop is over
 	breakLoop([]*RespErr) bool
@@ -173,8 +151,8 @@ func (waitAllController) breakLoop(resps []*RespErr) bool {
 	return true
 }
 
-//set up channel and context communication with doHandleSub
-func prepareSingleChan(ctx context.Context, reqs []Req, handlers []handler, c chan<- RespErrIdx, start int) context.CancelFunc {
+//start goroutine for each request, wait for response, and send response back to single channel(arg input).
+func prepareSingleChan(ctx context.Context, reqs []Req, handlers []Handler, c chan<- respErrIdx, start int) context.CancelFunc {
 	cancels := make([]context.CancelFunc, len(reqs))
 	cancel := func() {
 		for _, cancel := range cancels {
@@ -185,18 +163,14 @@ func prepareSingleChan(ctx context.Context, reqs []Req, handlers []handler, c ch
 		ReqCtx, ReqCancel := context.WithTimeout(ctx, getProcessTimeout(ctx))
 		cancels[i] = ReqCancel
 		go func(i int) {
-			RespErrChan := doHandle(ReqCtx, reqs[i], handlers[i])
-			select {
-			case resp, _ := <-RespErrChan:
-				c <- RespErrIdx{RespErr: resp, idx: i + start}
-			case <-ctx.Done():
-			}
+			result, err := handlers[i](ReqCtx, reqs[i])
+			c <- respErrIdx{RespErr{result, err}, i + start}
 		}(i)
 	}
 	return cancel
 }
 
-func waitSingleChan(ctx context.Context, reqs []Req, handlers []handler, c waitController, delay time.Duration) ([]*RespErr, error) {
+func waitSingleChan(ctx context.Context, reqs []Req, handlers []Handler, c waitController, delay time.Duration) ([]*RespErr, error) {
 	next := len(reqs)
 	var delayTimer *time.Timer
 	waitDelayTimeout := func() <-chan time.Time {
@@ -210,8 +184,8 @@ func waitSingleChan(ctx context.Context, reqs []Req, handlers []handler, c waitC
 		next = 1
 	}
 
-	RespErrIdxChan := make(chan RespErrIdx, len(reqs))
-	cancel := prepareSingleChan(ctx, reqs[:next], handlers[:next], RespErrIdxChan, 0)
+	respErrIdxChan := make(chan respErrIdx, len(reqs))
+	cancel := prepareSingleChan(ctx, reqs[:next], handlers[:next], respErrIdxChan, 0)
 	defer cancel()
 
 	RespErrs := make([]*RespErr, len(reqs))
@@ -223,7 +197,7 @@ func waitSingleChan(ctx context.Context, reqs []Req, handlers []handler, c waitC
 			return next != len(reqs)
 		}
 		fastTriggerNext := func() {
-			//if trigger exists, not expired and there remains untriggered handler, let it run immediately
+			//if trigger exists, not expired and there remains untriggered Handler, let it run immediately
 			if delayTimer != nil && delayTimer.Stop() && more() {
 				delayTimer.Reset(0)
 			}
@@ -232,24 +206,24 @@ func waitSingleChan(ctx context.Context, reqs []Req, handlers []handler, c waitC
 		select {
 		case <-waitDelayTimeout():
 			if more() {
-				//run next handler, SELECT on it, prepare next trigger if there remains
-				cancel := prepareSingleChan(ctx, reqs[next:next+1], handlers[next:next+1], RespErrIdxChan, next)
+				//run next Handler, SELECT on it, prepare next trigger if there remains
+				cancel := prepareSingleChan(ctx, reqs[next:next+1], handlers[next:next+1], respErrIdxChan, next)
 				defer cancel()
 				next++
 				if more() {
 					delayTimer.Reset(delay)
 				}
 			}
-		case RespErrIdx, ok := <-RespErrIdxChan:
-			chosen := RespErrIdx.idx
+		case respErrIdx, ok := <-respErrIdxChan:
+			chosen := respErrIdx.idx
 			if !ok {
 				panic("never happened")
 			}
-			RespErrs[chosen] = &RespErrIdx.RespErr
-			if c.earlyReturn(RespErrIdx.RespErr) {
-				return RespErrs, RespErrIdx.Err
+			RespErrs[chosen] = &respErrIdx.RespErr
+			if c.earlyReturn(respErrIdx.RespErr) {
+				return RespErrs, respErrIdx.Err
 			}
-			//if last one failed, faster trigger next handler
+			//if last one failed, faster trigger next Handler
 			if chosen+1 == next {
 				fastTriggerNext()
 			}
@@ -260,7 +234,10 @@ func waitSingleChan(ctx context.Context, reqs []Req, handlers []handler, c waitC
 	return RespErrs, nil
 }
 
-func waitPerReqChan(ctx context.Context, reqs []Req, handlers []handler, c waitController, delay time.Duration) ([]*RespErr, error) {
+//waitPerReqChan wait for resps one chan per request.
+//use reflect select for variadic number of requests.
+//for loop on select until either ctx cancle or we recieve all response.
+func waitPerReqChan(ctx context.Context, reqs []Req, handlers []Handler, c waitController, delay time.Duration) ([]*RespErr, error) {
 	next := len(reqs)
 	var delayTimer *time.Timer
 	waitDelayTimeout := func() <-chan time.Time {
@@ -289,7 +266,7 @@ func waitPerReqChan(ctx context.Context, reqs []Req, handlers []handler, c waitC
 		return next != len(reqs)
 	}
 	fastTriggerNext := func() {
-		//if trigger exists, not expired and there remains untriggered handler, let it run immediately
+		//if trigger exists, not expired and there remains untriggered Handler, let it run immediately
 		if delayTimer != nil && delayTimer.Stop() && more() {
 			delayTimer.Reset(0)
 		}
@@ -304,7 +281,7 @@ func waitPerReqChan(ctx context.Context, reqs []Req, handlers []handler, c waitC
 			return RespErrs, ctx.Err()
 		case 1:
 			if more() {
-				//run next handler, SELECT on it, prepare next trigger if there remains
+				//run next Handler, SELECT on it, prepare next trigger if there remains
 				chans, cancel := prepare(ctx, reqs[next:next+1], handlers[next:next+1])
 				defer cancel()
 				cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(chans[0])})
@@ -327,7 +304,7 @@ func waitPerReqChan(ctx context.Context, reqs []Req, handlers []handler, c waitC
 			if c.earlyReturn(RespErr) {
 				return RespErrs, RespErr.Err
 			}
-			//if last one failed, faster trigger next handler
+			//if last one failed, faster trigger next Handler
 			if chosen+1 == next {
 				fastTriggerNext()
 			}
@@ -336,7 +313,17 @@ func waitPerReqChan(ctx context.Context, reqs []Req, handlers []handler, c waitC
 	return RespErrs, nil
 }
 
-func waitPerReqChanConst(ctx context.Context, reqs []Req, handlers []handler, c waitController, delay time.Duration) ([]*RespErr, error) {
+func getChan(chans []<-chan RespErr, i int) <-chan RespErr {
+	if i < len(chans) {
+		return chans[i]
+	}
+	return nil
+}
+
+//waitPerReqChanConst wait for resps one chan per request with const number of request(len(reqs) <= 4)
+//set select case recv chan as nil after receive from it as we want only one response for one request.
+//for loop on select until either ctx cancle or we recieve all response.
+func waitPerReqChanConst(ctx context.Context, reqs []Req, handlers []Handler, c waitController, delay time.Duration) ([]*RespErr, error) {
 	next := len(reqs)
 	var delayTimer *time.Timer
 	waitDelayTimeout := func() <-chan time.Time {
@@ -359,7 +346,7 @@ func waitPerReqChanConst(ctx context.Context, reqs []Req, handlers []handler, c 
 		return next != len(reqs)
 	}
 	fastTriggerNext := func() {
-		//if trigger exists, not expired and there remains untriggered handler, let it run immediately
+		//if trigger exists, not expired and there remains untriggered Handler, let it run immediately
 		if delayTimer != nil && delayTimer.Stop() && more() {
 			delayTimer.Reset(0)
 		}
@@ -376,7 +363,7 @@ func waitPerReqChanConst(ctx context.Context, reqs []Req, handlers []handler, c 
 		select {
 		case <-waitDelayTimeout():
 			if more() {
-				//run next handler, SELECT on it, prepare next trigger if there remains
+				//run next Handler, SELECT on it, prepare next trigger if there remains
 				handlerChans, handlerCancel := prepare(ctx, reqs[next:next+1], handlers[next:next+1])
 				defer handlerCancel()
 				chans = append(chans, handlerChans...)
@@ -386,6 +373,7 @@ func waitPerReqChanConst(ctx context.Context, reqs []Req, handlers []handler, c 
 				}
 			}
 			continue
+		//getChan return nil for case i > len(chans), block forever. So it works for len(reqs) <= 4
 		case RespErr, ok = <-getChan(chans, 0):
 			chosen = 0
 		case RespErr, ok = <-getChan(chans, 1):
@@ -406,7 +394,7 @@ func waitPerReqChanConst(ctx context.Context, reqs []Req, handlers []handler, c 
 		if c.earlyReturn(RespErr) {
 			return RespErrs, RespErr.Err
 		}
-		//if last one failed, faster trigger next handler
+		//if last one failed, faster trigger next Handler
 		if chosen+1 == next {
 			fastTriggerNext()
 		}
@@ -419,7 +407,7 @@ var useSingleChan = false
 // Top down goroutine call.
 // bottom up channel return.
 // Asynchronously top down context cancel which Require callee’s explicitly listening.
-func wait(ctx context.Context, reqs []Req, handlers []handler, c waitController, delay time.Duration) ([]*RespErr, error) {
+func wait(ctx context.Context, reqs []Req, handlers []Handler, c waitController, delay time.Duration) ([]*RespErr, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
@@ -454,20 +442,20 @@ func WaitAnyResult(RespErrs []*RespErr, err error) (Resp, int, error) {
 }
 
 //WaitAny wait until any Request succeeded or all failed
-func WaitAny(ctx context.Context, reqs []Req, handlers []handler) ([]*RespErr, error) {
+func WaitAny(ctx context.Context, reqs []Req, handlers []Handler) ([]*RespErr, error) {
 	return wait(ctx, reqs, handlers, waitAnyControllerConst, 0)
 }
 
-// WaitAnyPrefer wait until any Request succeeded or all failed, but run each handler with delay
-// e.g. run first handler, wait some time(delay),
-// if handler complete first. if handler success, return, else run next handler.
-// if delay timeout first, run next handler, wait on both handler now.
-func WaitAnyPrefer(ctx context.Context, reqs []Req, handlers []handler, delay time.Duration) ([]*RespErr, error) {
+// WaitAnyPrefer wait until any Request succeeded or all failed, but run each Handler with delay
+// e.g. run first Handler, wait some time(delay),
+// if Handler complete first. if Handler success, return, else run next Handler.
+// if delay timeout first, run next Handler, wait on both Handler now.
+func WaitAnyPrefer(ctx context.Context, reqs []Req, handlers []Handler, delay time.Duration) ([]*RespErr, error) {
 	return wait(ctx, reqs, handlers, waitAnyControllerConst, delay)
 }
 
 //WaitAnyPrio wait until any Requests succeeded where all high priority Requests are failed.
-func WaitAnyPrio(ctx context.Context, reqs []Req, handlers []handler) ([]*RespErr, error) {
+func WaitAnyPrio(ctx context.Context, reqs []Req, handlers []Handler) ([]*RespErr, error) {
 	return wait(ctx, reqs, handlers, waitPrioControllerConst, 0)
 }
 
@@ -496,12 +484,12 @@ func WaitAllResult(RespErrs []*RespErr, err error) ([]Resp, error) {
 }
 
 //WaitAll wait until all Request succeeded or any Request failed
-func WaitAll(ctx context.Context, reqs []Req, handlers []handler) ([]*RespErr, error) {
+func WaitAll(ctx context.Context, reqs []Req, handlers []Handler) ([]*RespErr, error) {
 	return wait(ctx, reqs, handlers, waitAllControllerConst, 0)
 }
 
-// WaitAllAndGather wait all and gather
-func WaitAllAndGather(ctx context.Context, reqs []Req, handlers []handler, g gather) (Resp, error) {
+// WaitAllAndGather wait all and Gather
+func WaitAllAndGather(ctx context.Context, reqs []Req, handlers []Handler, g Gather) (Resp, error) {
 	ctx, cancel := setDefaultTimeout(ctx, 4*time.Second)
 	defer cancel()
 	RespErrs, err := WaitAll(ctx, reqs, handlers)
@@ -557,11 +545,10 @@ func waitAllAndGatherTest() {
 	}
 	result, err := WaitAllAndGather(context.Background(),
 		[]Req{Req([]int{1, 2}), Req([]int{3, 4}), Req([]int{5, 6})},
-		[]handler{sumHandler, sumHandler, sumHandler},
+		[]Handler{sumHandler, sumHandler, sumHandler},
 		sumGather,
 	)
 	if err != nil {
-		log.Println(err)
 		return
 	}
 	i := result.(int)
@@ -577,7 +564,7 @@ func waitAnyTest() {
 	reqs := []Req{Req([]int{1, 2}), Req([]int{3, 4}), Req([]int{5, 6})}
 	resp, i, err := WaitAnyResult(WaitAnyPrefer(context.Background(),
 		reqs,
-		[]handler{sumHandler, sumHandler, sumHandler},
+		[]Handler{sumHandler, sumHandler, sumHandler},
 		time.Second,
 	))
 	if err != nil {
