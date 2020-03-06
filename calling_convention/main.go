@@ -3,93 +3,138 @@ package main
 import (
 	"fmt"
 	"time"
+	"unsafe"
 )
 
-func calling(a int, b int) (c int, d int, e int) {
-	var k = 10
-	return a, b, k
+//Funcs end with Impl is the implementation of previous functions.
+
+/*
+simple calling convention.
+arguments and returns are pushed on stack in reverse order(e, d, c, b, a), and call function
+|      e
+|      d
+|      c
+|      b
+v      a
+rsp---
+
+*/
+func simpleCall(a int, b int) (c int, d int, e int) {
+	return a, b, 10
 }
 
-func simpleCall() {
-	calling(12, 13)
-}
-
-func nestCall() {
-	var a = 10
-	nest := func() {
-		a = 20
-	}
-	nest()
-	fmt.Println(a)
-}
-
-func do(f func(int)) {
-	f(20)
-}
-
-func nestPass() {
-	var a = 10
-	do(func(b int) {
-		a = b
-	})
-	fmt.Println(a)
-}
-
-func nestGoroutine() {
-	var b = 20
-	var a = 10
-	var c = 30
-	fmt.Println(&b)
-	fmt.Println(&a)
-	fmt.Println(&c)
-
-	go func(b int) {
-		var c = 20
-		fmt.Println("xx", &c)
-		fmt.Println("go")
-		fmt.Println(&a)
-		fmt.Println(a)
-		a = b
-	}(20)
-	return
-}
-
-func nestGoroutine1() {
-	var b = 40
-	var a = 40
-	var c = 40
-	fmt.Println(&b)
-	fmt.Println(&a)
-	fmt.Println(&c)
-}
-
-func nestGoroutine2() {
-	var b = 40
-	var a = 40
-	var c = 40
-	fmt.Println(&b)
-	fmt.Println(&a)
-	fmt.Println(&c)
-}
-
-func x(i int) {
-	go func() {
-		fmt.Println("kk", i)
+//simple closure, args and variable are shared
+func closure(i int) int {
+	var j = 10
+	func() {
+		i = 20
+		j = 30
 	}()
+	return i + j
+}
+
+//when closure is called, surrounding function is still on stack, we simple pass pointer of shares as args.
+func closureImpl(i int) int {
+	var j = 10
+	func(i *int, j *int) {
+		*i = 20
+		*j = 30
+	}(&i, &j)
+	return i + j
+}
+
+//call closure as goroutine where closure share vars and args with surrounding function.
+func goClosure(i int) int {
+	var j = 10
+	go func() {
+		i = 20
+		j = 30
+	}()
+	time.Sleep(time.Millisecond)
+	return i + j
+}
+
+//closure is run on a separate goroutine, whose stack is different from the surrounding function, so we must pass pointer of vars and args.
+//the variable must not allocated on stack even it declared to be(thanks GC, it's ok to allocate variable on heap), as we may reference it from another goroutine. Cross stack reference is just asking for trouble(GC).
+func goClosureImpl(i int) int {
+	ip := new(int)
+	*ip = i
+	j := new(int)
+	*j = 10
+	go func(i *int, j *int) {
+		*i = 20
+		*j = 30
+	}(ip, j)
+	time.Sleep(time.Millisecond)
+	return *ip + *j
+}
+
+//things get a bit tough if we pass closure as arg to function.
+//Here closureAsArg call doFunc, doFunc call closure which access variable of closureAsArg
+//There must be a generic way(compatible with simple function as arg) for closureAsArg and closure to negotiate using doFunc(proxy)
+func doFunc(f func()) {
+	f()
+}
+
+func closureAsArg(i int) int {
+	var j = 10
+	doFunc(func() {
+		i = 20
+		j = 30
+	})
+	return i + j
+}
+
+type funcval struct {
+	fn uintptr
+	// variable-size, fn-specific data here
+}
+
+//f is a pointer to funcval struct, fn is the address of a function, funcval may have fn-specific data following it.
+//doFuncImpl save funcval in ctx register(rbx in amd64)
+func doFuncImpl(fn *funcval) {
+	//save context on regitster
+	ctxReg = unsafe.Pointer(fn)
+	//call closure
+	(*(*func())(unsafe.Pointer(fn.fn)))()
+}
+
+//save on register is easy in assembly, but it's difficult for golang.
+var ctxReg unsafe.Pointer
+
+//
+func closureAsArgImpl(i int) int {
+	ip := new(int)
+	*ip = i
+	j := new(int)
+	*j = 10
+	type thisCtx struct {
+		funcval
+		i *int
+		j *int
+	}
+	FuncABCmouse := func() {
+		//we get thisCtx from ctx register
+		ctx := (*thisCtx)(ctxReg)
+		*ctx.i = 20
+		*ctx.j = 30
+	}
+	var fn = &thisCtx{
+		funcval: funcval{
+			fn: uintptr(unsafe.Pointer(&FuncABCmouse)),
+		},
+		i: ip,
+		j: j,
+	}
+	doFuncImpl((*funcval)(unsafe.Pointer(fn)))
+	return *ip + *j
 }
 
 func main() {
-	cancel := func() { fmt.Println("xx") }
-	defer cancel()
-	cancel = func() { fmt.Println("yy") }
-	defer cancel()
-	x(10)
-	time.Sleep(10 * time.Second)
-	return
-	var a = 10
-	fmt.Println("main", &a)
-	nestGoroutine()
-	nestGoroutine1()
-	nestGoroutine2()
-	time.Sleep(10 * time.Second)
+	fmt.Println(closure(10))
+	fmt.Println(closureImpl(10))
+	fmt.Println(goClosure(10))
+	fmt.Println(goClosureImpl(10))
+	fmt.Println(closureAsArg(10))
+	fmt.Println(closureAsArgImpl(10))
 }
