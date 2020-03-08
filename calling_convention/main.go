@@ -10,17 +10,31 @@ import (
 
 /*
 simple calling convention.
-arguments and returns are pushed on stack in reverse order(e, d, c, b, a), and call function
-|      e
-|      d
-|      c
-|      b
-v      a
-rsp---
+arguments and returns are pushed on stack in reverse order(e, d, c, b, a)
+main.main -> main.calling
+       ---> rbp(who call main.main)
+       |   ------   0x28
+       |     e
+0x38   |   ------   0x20
+       |     d
+0x30   |   ------   0x18
+       |     c
+0x28   |   ------   0x10
+       |     b
+0x20   |   ------   0x08
+       |     a
+0x18   |   ------   <--- old rsp
+       |    0x44f513(ip after call main.simpleCall)
+0x10   |   ------
+       -----rbp(main.main)
+0x08       ------   <--- rbp
+             k
+rsp -->    ------
 
 */
 func simpleCall(a int, b int) (c int, d int, e int) {
-	return a, b, 10
+	var k = 30
+	return a, b, k
 }
 
 //simple closure, args and variable are shared
@@ -91,7 +105,7 @@ type funcval struct {
 }
 
 //f is a pointer to funcval struct, fn is the address of a function, funcval may have fn-specific data following it.
-//doFuncImpl save funcval in ctx register(rbx in amd64)
+//doFuncImpl save funcval in ctx register(rdx in amd64)
 func doFuncImpl(fn *funcval) {
 	//save context on regitster
 	ctxReg = unsafe.Pointer(fn)
@@ -119,18 +133,19 @@ func closureAsArgImpl(i int) int {
 		*ctx.i = 20
 		*ctx.j = 30
 	}
-	var fn = &thisCtx{
+	var fc = thisCtx{
 		funcval: funcval{
 			fn: uintptr(unsafe.Pointer(&FuncABCmouse)),
 		},
 		i: ip,
 		j: j,
 	}
-	doFuncImpl((*funcval)(unsafe.Pointer(fn)))
+	doFuncImpl((*funcval)(unsafe.Pointer(&fc)))
 	return *ip + *j
 }
 
 func main() {
+	simpleCall(10, 20)
 	fmt.Println(closure(10))
 	fmt.Println(closureImpl(10))
 	fmt.Println(goClosure(10))
