@@ -1,0 +1,125 @@
+以下讨论都是针对论文On-the-Fly Garbage. Collection: An Exercise in. Cooperation进行的。
+
+2. The Grain of Action
+
+这个section里说明原子操作并指出原子粒度大的方案比原子粒度小的更容易实现，但是相应的锁粒度也会更大，并发行更差（这个在现在看来是一个老生常谈的问题，但这个是指导作者不断优化，不断改进方案的原动力，或许作者一开始就设计了原子粒度较小的那个，为了照顾看论文的我们，才按由易到难的方式编排本论文）。
+
+3. Reformulation of the Problem
+
+这个section里，作者通过引入nil node和将free list也看作data structure的一部分，让mutator的操作变成单一操作redirect an outgoing edge of a reachable node towards an already reachable one，下面是用golang例子来说明，nilNode为nil node，freeRoot是为free list引入的root结点。
+
+type node struct {
+	left  *node
+	right *node
+}
+
+//var nilNode = &node{&nilNode, &nilNode} not allowed in golang
+var nilNode = &node{}
+
+func init() {
+	nilNode.left = nilNode
+	nilNode.right = nilNode
+}
+
+var nodeArray = make([]*node, 0)
+
+func allocnode() *node {
+	//mutex
+	node := &node{nilNode, nilNode}
+	nodeArray = append(nodeArray, node)
+	return node
+}
+
+var freeRoot = &node{nilNode, nilNode}
+
+func getFromFreeList(p **node) {
+	//mutex
+	if freeRoot.left != nil {
+		//case 2 or 4 splited to two case 1 or 3 or 5
+		*p = freeRoot.left                 //case i
+		freeRoot.left = freeRoot.left.left //case i
+	} else {
+        //case 1 or 3 or 5
+		*p = allocnode()
+	}
+}
+
+var rootA *node = &node{nilNode, nilNode}
+var rootB *node = &node{nilNode, nilNode}
+
+/*
+(1) Redirecting an outgoing edge of a reachable node towards an already reachable one.
+(2) Redirecting an outgoing edge of a reachable node towards a not yet reachable one without outgoing edges.
+(3) Adding--where an outgoing edge was missing-- an edge pointing from a reachable node towards an already reachable one.
+(4) Adding--where an outgoing edge was missing-- an edge pointing from a reachable node towards a not yet reachable one without outgoing edges.
+(5) Removing an outgoing edge of areachable node.
+*/
+func mutator() {
+	getFromFreeList(&rootA.left) //case4: rootA.left = nilNode -> rootA.left = node1
+	getFromFreeList(&rootA.left) //case2: rootA.left = node1 -> rootA.left = node2
+	getFromFreeList(&rootB.left) //case4: rootB.left = nilNode -> rootB.left = node3
+	rootA.right = rootB.left     //case3: rootA.right = nilNode -> rootA.right = rootB.left(node3)
+	rootA.left = rootB.left      //case1: rootA.left = node2 -> rootA.left = rootB.left(node3)
+	rootB.left = nilNode         //case5: rootB.left = node3 -> rootB.left = nilNode
+}
+
+CC1: Every garbage node is eventually appended to the free list. More precisely,every garbage node present at the beginning of an appending phase will have been appendedby the end of the next appending phase.
+CC2: Appending a garbage node to the free list is the collector'sonly modificationof (the shapeof) the datastructure.
+
+CC1和CC2是本论文设计出的方案可行性的证明，CC2可以理解为只有garbage才会被collect，CC1可以理解为没有garbage能够逃过被回收的命运（如果存在不能被回收的垃圾，那这种垃圾随着时间迁移会变得越来愈多，最终把内存耗尽），并且能被很快回收（如果不能很快回收，例如要一个月才能回收，那对于繁忙服务器，一个月的内存分配不释放可能已经把内存耗尽了，这里的很快具体是指第一次appending之前产生的garbage在第二次appending结束前被回收，只要collector的执行周期比较短，这里不会有太大问题）
+
+4. The First Coarse-Grained Solution
+
+1、CC2的正确性证明
+
+因为marking phase不改变datastructure，我们只需要证明appending phase时CC2是否成立。
+
+我们首先证明进入最后一次marking phase循环时，不能有灰色节点（如果有的话，mutator的shade操作不会让灰色消失，这个灰色节点一定会被collector检测到，也就不是最后一次循坏了）
+
+接下来我们证明appending phase的入口时，也不会有灰色节点，collector能进入appending phase，意味着它最后一轮循坏没有检测到灰色节点，但这不意味当进入appending phase时没有灰色节点，有可能collector观测到某个节点为白色之后，mutator把它shade成灰色，这里我们很自然的想到如果存在这样一个不变式（不变式是指在整个marking phase都成立）P0（每个白色可触达的节点，一定有一个灰色的节点触达它）在marking phase时一定成立，那么我们就能保证在进入appending phase时没有灰色节点（因为mutator要能把节点变成灰色，该节点一定是白色可触达的，也就存在对应的灰色节点触达它，而前提是根本不存在灰色节点，因此产生矛盾）。
+
+下面我们证明在appending phase过程中CC2也成立，进入appending phase，所有白色节点都是垃圾（因为白色非垃圾一定会存在灰色节点，P0在进入appending phase成立，保证不会有灰色节点），在appending phase过程中，mutator不可能把白色垃圾变成灰色（mutator不可能操作不可触达的节点），也不可能把可触达的节点变成白色（mutator的shadow操作只能把颜色变深），collector自身只会将所有节点轮循一次，很容易证明collector轮循过程中遇到的白色节点一定是进入appending phase的那些白色节点（collector不会把白色节点变成其他颜色，collector可能会把其他颜色变成白色，但是这些节点都是已经被collector处理过的，collector不会再处理它）。
+
+2、CC2的正确性证明
+
+根据CC2，刚进入appending phase时，白色节点一定是垃圾，可触达节点一定是黑色，但是系统可能还在黑色的垃圾，这些垃圾会在appending phase结束之后变成白色的垃圾，mutator不可能操作他们（只能操作可触达），collector的marking phase也不可能操作他们，因此在进入下一次appending phase时，他们还是保持白色，他们会在这一次的appending phase被清除掉。
+
+为啥会存在黑色的垃圾呢？考虑一个简单的例子，collector在marking phase把某个可触达的叶子节点a标记成了黑色之后，mutator把a的父亲节点（唯一的父亲）从a指向另外一个b，这是a成了黑色垃圾。
+
+划重点（实际上P0可以换成任何Pn，只要Pn可以推导出P0，实际上论文的关键就是构造这样的不变式Pn让原子操作的粒度变小）。
+
+3、P1不变式的证明
+
+在The First Coarse-Grained Solution里Pn就是P1: "no edge points from a black node to a white one."。下面我们证明P1可以推导出P0，白色可触达的节点意味着存在一条从某个根节点到它的链路（可触达的定义），并且其根节点是黑色或者灰色（根结点初始状态已经是灰色，marking phase只能把它颜色变深成黑色），这样我们从该白色可触达节点，顺着触达链路回溯，如果前一个节点是灰色，证明结束，否则前一个节点只能是白色，那我们继续向前找，链路长度有限，并且根结点不是白色，这样总会有白色与灰色的相遇（黑白相遇已经被P1自己排除掉了），这个相遇点就是我们要找的灰色节点（并且这个灰色节点到白色节点的中间节点都是白色，这个特性是下面两个section的关键）。
+
+很容易证明M1和C1操作可以让P1保持不变，也就能保证CC1和CC2的正确性，但是M1和C1原子粒度太大，作者觉得还不够完美，因此有了下面的内容。
+
+5. A New Coarse-Grained Solution
+
+1、P2和P3的定义
+
+这里的Pn就是P2: "for each white reachable node,there exists a propagation path leading to it." 和 P3: "only the last edge placed by the mutator may lead from a black node to a white one."，P2&P3可以推导出P0，这是显而易见的， propagation path就是一种特殊的P0，这里P3其实是作者为了让P2在marking phase保持不变打的补丁。
+
+2、P2和P3不变式的证明
+
+C1可以保持P2成立，文中说得有点难懂，C1逻辑上分两步，shadow子节点（称之为C1.1）和把父亲节点变成黑色（称之为C1.2），第一步，如果子节点不是白色，那C1.1相当于啥也没做，如果子节点是白色，对于任何一个符合P2的白色可触达节点A，如果该子节点位于A的propagation path上，只需要把该子节点作为propagation path的根结点即可，也就是说shadow子节点让propagation path不变或者变短。C1.2不会破坏P2，该节点指向子节点的edges不属于任何propagation path（因为子节点是灰色的）。
+
+C1和P3没啥关系，不会让P3不成立。
+
+M2可以保持P2成立，M2逻辑上分两步shadow上一次的节点（称之为M2.1）和重定向新的节点（称之为M2.2），M2.1的证明和C1.1是一样的，这里存在另一种证明方法（根据P3，此时系统是符合P1的（即不存在黑色到白色的edge）），M2.2可以分情形证明，如果redirect的source节点是黑色，那么重定向的edge不属于任何propagation path（黑色节点），所有propagation path都不受影响；redirect的source节点不是黑色，此时系统是符合P1的，符合P1的系统一定符合P2。
+
+M2可以让P3保持不变，P3的出现就是为了兼容M2.2的第一种情况。
+
+6. A Fine-Grained Solution
+
+1、引言
+
+作者在section 2 The Grain of Action里指明了本文的目标，要让collector和mutator的原子操作尽量小，Section 5 A New Coarse-Grained Solution里我们可以看到C1可以被拆成两个操作，M2也可以被拆成两个操作，在section 5里的证明里被拆分的操作也能保持P2和P3成立，前提是拆分的操作中间不能穿插对方的操作。如果我们把拆分操作对方可能的行为也考虑进来，那是不是就有可能实现一个以被拆分操作为原子操作的solution。大佬在这个section已经给我们提供了解决方案，我们要深入理解这个方案，可以尝试顺着大佬的目标（让被拆分的操作成为原子操作），来尝试推导出大佬的方案。
+
+2、推导
+
+当C1.1执行之后，系统符合P2和P3，C1.2证明的关键在于父亲节点指向子节点的edge不属于P2中定义的propagation path（因为子节点已经是灰色的），C1.1和C1.2此时是两个原子操作，中间穿插mutator的redirect操作，可能会让父亲节点指向一个白色节点，这时这条edge可能变成propagation path的一部分，很自然的我们想到让P2变严格，在propagation path前面加上定语这种edge排除在外（作者把这种被collector操作处理过的节点的edges定义为C-edge）称其为P2.a（大胆假设，小心求证，这里看起来很自然只是因为我们站在上帝视角），这样M1.2操作的edge不属于任何符合P2.a的propagation path，显然P2.a在刚进入marking phase是成立的（这样P2.a可能成为合法的Pn），这样我们通过引入P2.a实现C1.1和C1.2的原子性。
+
+下面考虑M2.1和M2.2如何保持P2.a成立的，复用Section5的证明，M2.1只会把符合P2.a的propagation path变短，而M2.1不会产生C-edge，所以变短的propagation path也是符合P2.a的propagation path。M2.2的分析相对复杂，我们分情况讨论M2.2，当被操作的父亲节点是黑色的，被操作的这个edge就是c-edge（它能变成黑色，一定是collector检测到为灰色之后再把它变成黑色的），操作这个edge不会影响P2.a，如果被操作的父亲节点不是黑色，注意到此时系统很有可能没有黑色指向白色的edge，因此P2成立，如果此时系统不存在灰色到白色的c-edge，符合P2就意味着符合P2.a，因此我们引入前提，在M2.1到M2.2的过程中系统不存在黑色到白色的边也不存在灰色到白色的c-edge（称之为P3.a），这样如果被操作的是黑色节点或者c-edge，M2.2不会影响任何符合P2a的propagation path，否则M2.2执行之后，系统也不会存在黑色到白色的边或者灰色到白色的c-edge，这样P2a也能保证。现在我们需要证明我们的前提成立，M2.2执行之后系统可能存在黑色到白色的边（M2.2把黑色节点指向白色或者M2.2把灰色节点指向白色之后C1.2把它变成黑色），也可能成灰色到白色的c-edge（M2.2操作的是c-edge，并把它指向白色），但是这种edge只会存在最多一条，并且这条edge和M2.2的操作脱不开关系，下一次的M2.1自然会替这次M2.2擦屁股（让子节点变成灰色或者黑色），保证M2.1结束时P3.a成立，即前提成立。
+
+注意到以上的证明思路也适合Section4推导出section5，很有可能作者就是这样从section4优化出section5，然后再有section5优化出section5。
